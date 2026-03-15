@@ -1,47 +1,35 @@
-diff --git a/scanner.py b/scanner.py
-index 8b137891791fe96927ad78e64b0aad7bded08bdc..24597941c60e60551caffa739539e840fe4525ba 100644
---- a/scanner.py
-+++ b/scanner.py
-@@ -1 +1,139 @@
 +#!/usr/bin/env python3
-+"""Scan active Polymarket markets and print links for ultra-low priced outcomes."""
  
-+from __future__ import annotations
-+
-+import json
-+import sys
-+import urllib.error
-+import urllib.parse
-+import urllib.request
-+from typing import Any, Iterable
++import time
++import requests
 +
 +API_URL = "https://gamma-api.polymarket.com/markets"
 +PAGE_SIZE = 100
-+LOWER_BOUND = 0.0
-+UPPER_BOUND = 0.0011
++MIN_PRICE = 0.0
++MAX_PRICE = 0.0011
 +TIMEOUT = 20
++RETRY_TIMES = 3
 +
 +
-+def parse_prices(raw_prices: Any) -> list[float]:
-+    """Normalize `outcomePrices` into a list of floats."""
++def parse_outcome_prices(raw_prices):
++    """把 outcomePrices 解析成 float 列表。"""
 +    if raw_prices is None:
 +        return []
 +
-+    parsed = raw_prices
-+    if isinstance(raw_prices, str):
++    if isinstance(raw_prices, list):
++        items = raw_prices
++    elif isinstance(raw_prices, str):
 +        text = raw_prices.strip()
 +        if not text:
 +            return []
-+        try:
-+            parsed = json.loads(text)
-+        except json.JSONDecodeError:
-+            parsed = [p.strip() for p in text.split(",") if p.strip()]
-+
-+    if not isinstance(parsed, Iterable) or isinstance(parsed, (str, bytes, dict)):
++        # 兼容类似 "[0.1,0.9]" 或 "0.1,0.9"
++        text = text.strip("[]")
++        items = [part.strip().strip('"').strip("'") for part in text.split(",") if part.strip()]
++    else:
 +        return []
 +
-+    prices: list[float] = []
-+    for item in parsed:
++    prices = []
++    for item in items:
 +        try:
 +            prices.append(float(item))
 +        except (TypeError, ValueError):
@@ -49,27 +37,11 @@ index 8b137891791fe96927ad78e64b0aad7bded08bdc..24597941c60e60551caffa739539e840
 +    return prices
 +
 +
-+def price_in_target_range(prices: Iterable[float]) -> bool:
-+    return any(LOWER_BOUND <= price <= UPPER_BOUND for price in prices)
++def is_target_market(prices):
++    return any(MIN_PRICE <= price <= MAX_PRICE for price in prices)
 +
 +
-+def http_get_json(url: str, params: dict[str, Any]) -> Any:
-+    query = urllib.parse.urlencode(params)
-+    request_url = f"{url}?{query}"
-+    request = urllib.request.Request(
-+        request_url,
-+        headers={
-+            "Accept": "application/json",
-+            "User-Agent": "scanner/1.0",
-+        },
-+    )
-+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-+        charset = response.headers.get_content_charset("utf-8")
-+        body = response.read().decode(charset)
-+    return json.loads(body)
-+
-+
-+def fetch_page(offset: int) -> list[dict[str, Any]]:
++def fetch_markets_page(offset):
 +    params = {
 +        "active": "true",
 +        "closed": "false",
@@ -77,36 +49,50 @@ index 8b137891791fe96927ad78e64b0aad7bded08bdc..24597941c60e60551caffa739539e840
 +        "offset": offset,
 +    }
 +
-+    payload = http_get_json(API_URL, params)
-+    if isinstance(payload, list):
-+        return payload
-+    if isinstance(payload, dict):
-+        for key in ("data", "markets", "results"):
-+            value = payload.get(key)
-+            if isinstance(value, list):
-+                return value
++    for attempt in range(1, RETRY_TIMES + 1):
++        try:
++            print("正在尝试连接 Polymarket API...")
++            response = requests.get(API_URL, params=params, timeout=TIMEOUT)
++            response.raise_for_status()
++            data = response.json()
++
++            if isinstance(data, list):
++                return data
++            if isinstance(data, dict):
++                for key in ("data", "markets", "results"):
++                    value = data.get(key)
++                    if isinstance(value, list):
++                        return value
++            return []
++        except requests.RequestException as exc:
++            print(f"[警告] 第 {attempt}/{RETRY_TIMES} 次请求失败: {exc}")
++            if attempt < RETRY_TIMES:
++                time.sleep(2)
++
++    print("[错误] 多次请求失败，本次扫描提前结束。")
 +    return []
 +
 +
-+def scan_markets() -> list[str]:
-+    matched_links: list[str] = []
-+    offset = 0
++def scan_markets():
++    matched_links = []
 +    total_scanned = 0
 +    page = 1
++    offset = 0
 +
 +    while True:
-+        markets = fetch_page(offset)
++        markets = fetch_markets_page(offset)
 +        if not markets:
-+            print(f"[进度] 第 {page} 页无数据，扫描结束。")
++            print(f"[进度] 第 {page} 页无数据或请求失败，扫描结束。")
 +            break
 +
-+        print(f"[进度] 正在扫描第 {page} 页，{len(markets)} 个标的（offset={offset}）...")
++        print(f"[进度] 正在扫描第 {page} 页，{len(markets)} 个标的（offset={offset}）")
 +
 +        for market in markets:
 +            total_scanned += 1
 +            slug = market.get("slug")
-+            prices = parse_prices(market.get("outcomePrices"))
-+            if slug and price_in_target_range(prices):
++            prices = parse_outcome_prices(market.get("outcomePrices"))
++
++            if slug and is_target_market(prices):
 +                link = f"https://polymarket.com/market/{slug}"
 +                matched_links.append(link)
 +                print(f"[发现] {link} | outcomePrices={prices}")
@@ -117,28 +103,16 @@ index 8b137891791fe96927ad78e64b0aad7bded08bdc..24597941c60e60551caffa739539e840
 +
 +        offset += PAGE_SIZE
 +        page += 1
++        time.sleep(0.2)
 +
 +    print(f"\n[完成] 共扫描 {total_scanned} 个 active=true 标的。")
 +    print(f"[完成] 命中 {len(matched_links)} 个标的。")
++
 +    if matched_links:
 +        print("\n[结果链接]")
 +        for link in matched_links:
 +            print(link)
 +
-+    return matched_links
-+
-+
-+def main() -> int:
-+    try:
-+        scan_markets()
-+        return 0
-+    except urllib.error.URLError as exc:
-+        print(f"[错误] 网络请求失败: {exc}", file=sys.stderr)
-+        return 1
-+    except json.JSONDecodeError as exc:
-+        print(f"[错误] 解析响应 JSON 失败: {exc}", file=sys.stderr)
-+        return 1
-+
 +
 +if __name__ == "__main__":
-+    raise SystemExit(main())
++    scan_markets()
