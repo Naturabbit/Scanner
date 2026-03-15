@@ -142,4 +142,3 @@ index 8b137891791fe96927ad78e64b0aad7bded08bdc..24597941c60e60551caffa739539e840
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
-
