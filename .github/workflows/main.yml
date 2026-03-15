@@ -1,0 +1,13 @@
+name: scanner
+on:
+  workflow_dispatch: # 仅手动，再也不用担心自动运行报错了
+jobs:
+  run-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - run: pip install requests
+      - run: python scanner.py
