@@ -2,8 +2,7 @@ name: scanner
 
 on:
   workflow_dispatch: # 仅手动，再也不用担心自动运行报错了
-  workflow_dispatch:
-
+  
 jobs:
   run-scan:
     runs-on: ubuntu-latest
