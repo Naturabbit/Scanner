@@ -1,116 +1,130 @@
+import os
 import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+
 import requests
 
-API_URL = "https://gamma-api.polymarket.com/markets"
-PAGE_SIZE = 100
-MIN_PRICE = 0.0
-MAX_PRICE = 0.0011
-TIMEOUT = 20
+BASE_URL = "https://api.binance.com"
+EXCHANGE_INFO_URL = f"{BASE_URL}/api/v3/exchangeInfo"
+KLINES_URL = f"{BASE_URL}/api/v3/klines"
+REQUEST_TIMEOUT = 15
 RETRY_TIMES = 3
+RETRY_SLEEP_SECONDS = 1
+KLINE_INTERVAL = "1d"
 
 
-def parse_outcome_prices(raw_prices):
-    """把 outcomePrices 解析成 float 列表。"""
-    if raw_prices is None:
-        return []
-
-    if isinstance(raw_prices, list):
-        items = raw_prices
-    elif isinstance(raw_prices, str):
-        text = raw_prices.strip()
-        if not text:
-            return []
-        # 兼容类似 "[0.1,0.9]" 或 "0.1,0.9"
-        text = text.strip("[]")
-        items = [part.strip().strip('"').strip("'") for part in text.split(",") if part.strip()]
-    else:
-        return []
-
-    prices = []
-    for item in items:
-        try:
-            prices.append(float(item))
-        except (TypeError, ValueError):
-            continue
-    return prices
-
-
-def is_target_market(prices):
-    return any(MIN_PRICE <= price <= MAX_PRICE for price in prices)
-
-
-def fetch_markets_page(offset):
-    params = {
-        "active": "true",
-        "closed": "false",
-        "limit": PAGE_SIZE,
-        "offset": offset,
-    }
-
+def request_json(url: str, params: Optional[Dict] = None) -> Optional[Dict]:
+    """带基础重试能力的 GET 请求。"""
     for attempt in range(1, RETRY_TIMES + 1):
         try:
-            print("正在尝试连接 Polymarket API...")
-            response = requests.get(API_URL, params=params, timeout=TIMEOUT)
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
-            data = response.json()
-
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                for key in ("data", "markets", "results"):
-                    value = data.get(key)
-                    if isinstance(value, list):
-                        return value
-            return []
+            return response.json()
         except requests.RequestException as exc:
-            print(f"[警告] 第 {attempt}/{RETRY_TIMES} 次请求失败: {exc}")
+            print(f"[警告] 请求失败 {attempt}/{RETRY_TIMES}: {url} params={params}, error={exc}")
             if attempt < RETRY_TIMES:
-                time.sleep(2)
-
-    print("[错误] 多次请求失败，本次扫描提前结束。")
-    return []
+                time.sleep(RETRY_SLEEP_SECONDS)
+    return None
 
 
-def scan_markets():
-    matched_links = []
-    total_scanned = 0
-    page = 1
-    offset = 0
+def fetch_usdt_symbols() -> List[Dict]:
+    """获取所有 USDT 交易对。"""
+    data = request_json(EXCHANGE_INFO_URL)
+    if not data or "symbols" not in data:
+        return []
 
-    while True:
-        markets = fetch_markets_page(offset)
-        if not markets:
-            print(f"[进度] 第 {page} 页无数据或请求失败，扫描结束。")
-            break
+    usdt_symbols = []
+    for item in data["symbols"]:
+        # 仅保留状态正常、且以 USDT 结尾的现货交易对
+        if item.get("quoteAsset") == "USDT" and item.get("status") == "TRADING":
+            usdt_symbols.append(item)
+    return usdt_symbols
 
-        print(f"[进度] 正在扫描第 {page} 页，{len(markets)} 个标的（offset={offset}）")
 
-        for market in markets:
-            total_scanned += 1
-            slug = market.get("slug")
-            prices = parse_outcome_prices(market.get("outcomePrices"))
+def fetch_listing_datetime(symbol: str) -> Optional[datetime]:
+    """通过最早 K 线 open_time 推断交易对实际上线时间。"""
+    params = {
+        "symbol": symbol,
+        "interval": KLINE_INTERVAL,
+        "startTime": 0,
+        "limit": 1,
+    }
+    data = request_json(KLINES_URL, params=params)
 
-            if slug and is_target_market(prices):
-                link = f"https://polymarket.com/market/{slug}"
-                matched_links.append(link)
-                print(f"[发现] {link} | outcomePrices={prices}")
+    # 返回数据格式示例: [[open_time, open, high, low, close, volume, ...]]
+    if not isinstance(data, list) or not data or not isinstance(data[0], list):
+        return None
 
-        if len(markets) < PAGE_SIZE:
-            print("[进度] 已到最后一页。")
-            break
+    open_time_ms = data[0][0]
+    if not isinstance(open_time_ms, int):
+        return None
 
-        offset += PAGE_SIZE
-        page += 1
-        time.sleep(0.2)
+    return datetime.fromtimestamp(open_time_ms / 1000, tz=timezone.utc)
 
-    print(f"\n[完成] 共扫描 {total_scanned} 个 active=true 标的。")
-    print(f"[完成] 命中 {len(matched_links)} 个标的。")
 
-    if matched_links:
-        print("\n[结果链接]")
-        for link in matched_links:
-            print(link)
+def format_markdown(rows: List[Dict]) -> str:
+    """把筛选结果整理为 Markdown 表格。"""
+    if not rows:
+        return "## Binance 上线时间筛选结果\n\n最近 30~365 天内暂无符合条件的 USDT 交易对。"
+
+    lines = [
+        "## Binance 上线时间筛选结果",
+        "",
+        "| 币种名称 | 上线日期(UTC) | 存续天数 |",
+        "|---|---|---|",
+    ]
+
+    for row in rows:
+        lines.append(f"| {row['symbol']} | {row['listing_date']} | {row['age_days']} |")
+
+    return "\n".join(lines)
+
+
+def main() -> None:
+    now = datetime.now(timezone.utc)
+    min_days = 30
+    max_days = 365
+
+    symbols = fetch_usdt_symbols()
+    if not symbols:
+        markdown = "## Binance 上线时间筛选结果\n\n获取交易对失败或无可用数据。"
+        print(markdown)
+        return
+
+    rows = []
+    for item in symbols:
+        symbol = item.get("symbol")
+        if not symbol:
+            continue
+
+        listing_dt = fetch_listing_datetime(symbol)
+        # 为避免触发接口限频，增加轻量延迟
+        time.sleep(0.05)
+
+        if not listing_dt:
+            continue
+
+        age_days = (now - listing_dt).days
+        if min_days <= age_days <= max_days:
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "listing_date": listing_dt.strftime("%Y-%m-%d"),
+                    "age_days": age_days,
+                }
+            )
+
+    rows.sort(key=lambda x: x["age_days"])
+    markdown = format_markdown(rows)
+    print(markdown)
+
+    # 兼容直接运行时写入 GitHub Step Summary
+    summary_path = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        with open(summary_path, "a", encoding="utf-8") as f:
+            f.write(markdown + "\n")
 
 
 if __name__ == "__main__":
-    scan_markets()
+    main()
